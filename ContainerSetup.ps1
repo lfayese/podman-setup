@@ -223,24 +223,7 @@ function Invoke-InVM {
         Write-Log -Level ERROR -Message "VM command execution failed: $_"
         throw
     }
-        $result = & $sshPath @sshArgs 2>&1
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "SSH command failed with exit code $LASTEXITCODE $result"
-        }
-
-        return $result
-    }
-    catch {
-        Write-Log -Level ERROR -Message "SSH command failed: $($_.Exception.Message)"
-        throw @"
-SSH connection failed. Please check:
-1. Is the Podman VM running? (podman machine list)
-2. Is SSH service running in the VM? (podman machine ssh $($SSH.MachineName) 'systemctl status sshd')
-3. Is the SSH key path correct? ($($SSH.KeyPath))
-4. Is the SSH port accessible? (Test-NetConnection 127.0.0.1 -Port $($SSH.Port))
-"@
-    }
+}
 
 function Invoke-DownloadAndExtract {
     [CmdletBinding()]
