@@ -32,8 +32,8 @@ Param(
     [string]$CertificatePath = "$env:USERPROFILE\certs\ZscalerRootCertificate-2048-SHA256.crt",
     [string]$GitCABundlePath = "$env:USERPROFILE\certs\.git-ca-bundle.pem",
     [string]$BashrcPath = "C:\Tools\podman-setup\.bashrc",
-    [int]$VMCpus = 10,
-    [int]$VMMemoryMB = 10096,
+    [int]$VMCpus = 2,
+    [int]$VMMemoryMB = 4096,
     [int]$VMDiskSizeGB = 110,
     [bool]$IsRootful = $true,
 
