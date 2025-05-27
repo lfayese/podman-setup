@@ -1,3 +1,4 @@
+
 <#
 .SYNOPSIS
 Sets up complete container environment for Windows 11 with Podman VM and Windows container tools.
@@ -118,6 +119,36 @@ function Invoke-WithRetry {
         }
     }
 }
+
+function Wait-ForSSHReady {
+  [CmdletBinding()]
+  param(
+      [Parameter(Mandatory)][string]$MachineName,
+      [int]$MaxWaitSeconds = 180,
+      [int]$CheckInterval = 10
+  )
+  Write-Log -Level INFO -Message "Waiting for SSH to be ready on machine: $MachineName"
+  $elapsed = 0
+  while ($elapsed -lt $MaxWaitSeconds) {
+      try {
+          Write-Log -Level INFO -Message "Testing SSH connection via podman machine ssh..."
+          $result = & podman machine ssh $MachineName "echo 'SSH_READY'" 2>&1
+          if ($LASTEXITCODE -eq 0 -and $result -match "SSH_READY") {
+              Write-Log -Level SUCCESS -Message "SSH is ready via podman machine ssh"
+              return $true
+          }
+      }
+      catch {
+          Write-Log -Level INFO -Message "SSH not ready yet: $_"
+      }
+      Write-Log -Level INFO -Message "Waiting for SSH... ($elapsed/$MaxWaitSeconds seconds)"
+      Start-Sleep -Seconds $CheckInterval
+      $elapsed += $CheckInterval
+  }
+  Write-Log -Level ERROR -Message "SSH not ready after $MaxWaitSeconds seconds"
+  return $false
+}
+
 function Add-ToPath {
     [CmdletBinding()] Param([Parameter(Mandatory)][string]$Entry)
     $mp = [Environment]::GetEnvironmentVariable('Path','Machine')
@@ -134,87 +165,40 @@ function Copy-ToVM {
         [Parameter(Mandatory)][string]$Dest,
         [Parameter(Mandatory)][hashtable]$SSH
     )
-    # First, check if we can use the podman machine cp command as a safer alternative
+    # Wait for SSH to be ready
+    if (-not (Wait-ForSSHReady -MachineName $SSH.MachineName)) {
+        throw "SSH connection not ready. Cannot copy files to VM."
+    }
+    # Try podman machine cp first (most reliable method)
     try {
-        Write-Log -Level INFO -Message "Attempting to copy file using podman machine cp"
-        $machineName = $env:PODMAN_MACHINE_NAME
-        if (-not $machineName) {
-            # Try to extract machine name from the socket path or other info
-            if ($SSH.MachineName) {
-                $machineName = $SSH.MachineName
-            }
-        }
-        if ($machineName) {
-            & podman machine cp $Src "${machineName}:$Dest"
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log -Level SUCCESS -Message "Successfully copied file using podman machine cp"
-                return
-            } else {
-                Write-Log -Level WARNING -Message "podman machine cp failed, falling back to SCP"
-            }
+        Write-Log -Level INFO -Message "Copying file using podman machine cp: $Src -> $Dest"
+        & podman machine cp $Src "$($SSH.MachineName):$Dest" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log -Level SUCCESS -Message "Successfully copied file using podman machine cp"
+            return
+        } else {
+            Write-Log -Level WARNING -Message "podman machine cp failed with exit code $LASTEXITCODE, trying alternative method"
         }
     } catch {
-        Write-Log -Level WARNING -Message "Could not use podman machine cp, falling back to SCP: $_"
+        Write-Log -Level WARNING -Message "podman machine cp failed: $_"
     }
-
-    # For Podman VM, we explicitly use the VM's internal user (not domain user)
-    # Remove domain prefix if present in user
-    $user = $SSH.User -replace '^.*\\', ''
-
-    # Get the connection port from podman machine inspect if not set
-    $port = $SSH.Port
-    if ([string]::IsNullOrEmpty($port)) {
-        try {
-            $machineInfo = & podman machine inspect $machineName | ConvertFrom-Json
-            $port = $machineInfo.SSHConfig.Port
-            Write-Log -Level INFO -Message "Retrieved port from machine inspect: $port"
-        } catch {
-            Write-Log -Level WARNING -Message "Could not get SSH port from machine inspect: $_"
-            # Continue without port specification
-        }
-    }
-
-    # Use Windows built-in OpenSSH
-    $scpPath = "$env:SystemRoot\System32\OpenSSH\scp.exe"
-
-    # Ensure we can find SCP
-    if (-not (Test-Path $scpPath)) {
-        Write-Log -Level WARNING -Message "Could not find Windows OpenSSH SCP at $scpPath, falling back to PATH"
-        $scpPath = "scp"  # Fall back to PATH-based resolution
-    } else {
-        Write-Log -Level INFO -Message "Using Windows built-in SCP: $scpPath"
-    }
-
-    # The port argument for scp is capital -P
-    $scpArgs = @('-i', $SSH.KeyPath)
-    if ($port -and $port -ne '') {
-        $scpArgs += @('-P', $port)
-        Write-Log -Level INFO -Message "Using SSH port: $port"
-    } else {
-        Write-Log -Level WARNING -Message "No SSH port specified, using default port 22"
-    }
-    $scpArgs += @(
-        '-o', 'UserKnownHostsFile=/dev/null',
-        '-o', 'StrictHostKeyChecking=no',
-        '-o', 'PubkeyAuthentication=yes',
-        '-o', 'IdentitiesOnly=yes',
-        '-o', 'PasswordAuthentication=no',
-        '-o', 'BatchMode=yes',
-        '-o', 'LogLevel=ERROR',
-        $Src
-    )
-    $scpArgs += "$user@127.0.0.1:$Dest"
-
+    # If podman machine cp fails, try using SSH directly through podman machine ssh
     try {
-        Write-Log -Level INFO -Message "Copy '$Src' (Attempt 1/$script:MaxRetries)"
-        & $scpPath @scpArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "SCP command failed with exit code $LASTEXITCODE"
+        Write-Log -Level INFO -Message "Attempting file copy via podman machine ssh with base64 encoding"
+        $fileContent = Get-Content -Path $Src -Raw -Encoding UTF8
+        $base64Content = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($fileContent))
+        $transferCmd = "echo '$base64Content' | base64 -d > '$Dest'"
+        & podman machine ssh $SSH.MachineName $transferCmd
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log -Level SUCCESS -Message "Successfully copied file via SSH base64 transfer"
+            return
+        } else {
+            throw "SSH base64 transfer failed with exit code $LASTEXITCODE"
         }
     }
     catch {
-        Write-Log -Level ERROR -Message "Failed to copy file to VM: $($_.Exception.Message)"
-        throw
+        Write-Log -Level ERROR -Message "All file copy methods failed: $_"
+        throw "Failed to copy file to VM: $_"
     }
 }
 
@@ -223,63 +207,22 @@ function Invoke-InVM {
         [Parameter(Mandatory)][string]$Cmd,
         [Parameter(Mandatory)][hashtable]$SSH
     )
-    # First check if we can use podman machine ssh directly (preferred method)
-    if ($SSH.MachineName) {
-        try {
-            Write-Log -Level INFO -Message "In-VM: $Cmd (via podman machine ssh)"
-            $result = & podman machine ssh $SSH.MachineName "$Cmd" 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "Command failed with exit code ${LASTEXITCODE}: ${result}"
-            }
-            return $result
-        }
-        catch {
-            Write-Log -Level WARNING -Message "podman machine ssh failed, falling back to OpenSSH: $_"
-            # Fall through to OpenSSH method
-        }
+    # Wait for SSH to be ready
+    if (-not (Wait-ForSSHReady -MachineName $SSH.MachineName)) {
+        throw "SSH connection not ready. Cannot execute commands in VM."
     }
-
-    # For Podman VM, we explicitly use the VM's internal user (not domain user)
-    # Remove domain prefix if present in user
-    $user = if ($SSH.User) { $SSH.User -replace '^.*\\', '' } else { "user" }
-
-    # Use Windows built-in OpenSSH
-    $sshPath = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
-
-    # Ensure we can find SSH
-    if (-not (Test-Path $sshPath)) {
-        Write-Log -Level WARNING -Message "Could not find Windows OpenSSH client at $sshPath, falling back to PATH"
-        $sshPath = "ssh"  # Fall back to PATH-based resolution
-    } else {
-        Write-Log -Level INFO -Message "Using Windows built-in SSH: $sshPath"
-    }
-
-    $sshArgs = @(
-        '-i', $SSH.KeyPath
-    )
-
-    # Only add port if it's specified
-    if ($SSH.Port -and $SSH.Port -ne '') {
-        $sshArgs += @('-p', $SSH.Port)
-    }
-
-    $sshArgs += @(
-        '-o', 'UserKnownHostsFile=/dev/null',
-        '-o', 'StrictHostKeyChecking=no',
-        '-o', 'PubkeyAuthentication=yes',
-        '-o', 'IdentitiesOnly=yes',
-        '-o', 'PasswordAuthentication=no',
-        '-o', 'BatchMode=yes',
-        # Add -T flag to disable pseudo-terminal allocation (fixes stty errors)
-        '-T',
-        # Use 127.0.0.1 instead of localhost for more reliable connections
-        "$user@127.0.0.1",
-        # Modify the command to avoid terminal control characters
-        "TERM=dumb $Cmd"
-    )
-
     try {
-        Write-Log -Level INFO -Message "In-VM: $Cmd (Attempt 1/$MaxRetries)"
+        Write-Log -Level INFO -Message "Executing in VM: $Cmd"
+        $result = & podman machine ssh $SSH.MachineName "$Cmd" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Command failed with exit code ${LASTEXITCODE}: ${result}"
+        }
+        return $result
+    }
+    catch {
+        Write-Log -Level ERROR -Message "VM command execution failed: $_"
+        throw
+    }
         $result = & $sshPath @sshArgs 2>&1
 
         if ($LASTEXITCODE -ne 0) {
@@ -298,7 +241,7 @@ SSH connection failed. Please check:
 4. Is the SSH port accessible? (Test-NetConnection 127.0.0.1 -Port $($SSH.Port))
 "@
     }
-}
+
 function Invoke-DownloadAndExtract {
     [CmdletBinding()]
     param(
