@@ -1,63 +1,27 @@
 <#
 .SYNOPSIS
-Comprehensive container environment setup for Windows 11 - combines Podman VM setup and Windows container tools installation.
+Sets up complete container environment for Windows 11 with Podman VM and Windows container tools.
 
 .DESCRIPTION
-This script provides a complete container development environment by:
-* Setting up a Podman VM with Linux & Windows container support
-* Installing and configuring containerd, CNI plugins, nerdctl, cri-tools, BuildKit, and OpenSSH
+Creates integrated container development environment with Podman VM (Linux/Windows containers) and
+Windows native container tools (containerd, CNI, nerdctl, BuildKit). Features automatic setup with
+certificate configuration and SSH access.
 
-Features:
-* Self-elevates to Administrator
-* Validates prerequisites (certs, Podman, Windows features)
-* Tears down & rebuilds VM using best-practice verbs
-* Deploys assets: provision.sh, certs, .bashrc
-* Executes in-VM provisioning, then tests Windows NanoServer container
-* Installs containerd, CNI plugins, nerdctl, cri-tools, BuildKit directly on Windows
-* Configures OpenSSH for remote management
+.EXAMPLE
+# Setup with default settings
+.\ContainerSetup.ps1
 
-.PARAMETER MachineName
-Name of the Podman machine to create (default: podman-machine-default)
+.EXAMPLE
+# Setup only Podman VM with custom resources
+.\ContainerSetup.ps1 -VMCpus 4 -VMMemoryMB 4096 -VMDiskSizeGB 60 -SetupWindowsTools $false
 
-.PARAMETER CertificatePath
-Path to Zscaler Root Certificate
+.EXAMPLE
+# Setup only Windows container tools
+.\ContainerSetup.ps1 -SetupPodmanVM $false -SetupWindowsTools $true
 
-.PARAMETER GitCABundlePath
-Path to Git CA bundle
-
-.PARAMETER BashrcPath
-Path to custom .bashrc file for the Podman VM
-
-.PARAMETER VMCpus
-Number of CPUs to allocate to the Podman VM
-
-.PARAMETER VMMemoryMB
-Amount of memory (MB) to allocate to the Podman VM
-
-.PARAMETER VMDiskSizeGB
-Disk size (GB) for the Podman VM
-
-.PARAMETER IsRootful
-Whether to create a rootful Podman machine (default: $true, recommended for running Windows containers)
-
-.PARAMETER SSHPublicKey
-Public key material to seed into Administrators' authorized_keys for Windows container tools.
-If not provided, the script will automatically use the Podman Desktop SSH public key.
-
-.PARAMETER SetupPodmanVM
-Whether to set up the Podman VM (default: $true)
-
-.PARAMETER SetupWindowsTools
-Whether to set up Windows container tools (default: $true)
-
-.PARAMETER DeployBootcImage
-Whether to build and deploy the bootc container image (default: $true)
-
-.PARAMETER MaxRetries
-Maximum number of retries for operations
-
-.PARAMETER RetryDelaySeconds
-Delay between retries in seconds
+.EXAMPLE
+# Full setup with custom certificate paths
+.\ContainerSetup.ps1 -CertificatePath "C:\certs\ZscalerRoot.crt" -GitCABundlePath "C:\certs\git-ca.pem"
 #>
 
 [CmdletBinding()]
@@ -309,7 +273,13 @@ Write-Log -Level INFO -Message "Container environment setup started"
 #--- HELPER FUNCTIONS -------------------------------------------------------
 function Get-PodmanDesktopPublicKey {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter()]
+        [switch]$UpdateContainerFiles = $false,
+
+        [Parameter()]
+        [string]$ContainersDir = (Join-Path $PSScriptRoot 'containers')
+    )
 
     $podmanPubKeyPath = Join-Path $env:USERPROFILE ".local\share\containers\podman\machine\machine.pub"
 
@@ -322,6 +292,56 @@ function Get-PodmanDesktopPublicKey {
     $publicKeyContent = $publicKeyContent.Trim()
 
     Write-Log -Level INFO -Message "Successfully read Podman Desktop public key"
+
+    # If requested, update container configuration files with the SSH key
+    if ($UpdateContainerFiles) {
+        # Create containers directory if it doesn't exist
+        if (-not (Test-Path $ContainersDir)) {
+            New-Item -Path $ContainersDir -ItemType Directory -Force | Out-Null
+            Write-Log -Level INFO -Message "Created containers directory at $ContainersDir"
+        }
+
+        # Update config file
+        $configPath = Join-Path $ContainersDir 'config'
+        try {
+            # If file exists, read it first
+            if (Test-Path $configPath) {
+                $configContent = Get-Content $configPath -Raw
+                # Only add the key if it doesn't already contain it
+                if ($configContent -notmatch [regex]::Escape($publicKeyContent)) {
+                    Add-Content -Path $configPath -Value "`n# Podman Desktop SSH Public Key`n$publicKeyContent`n"
+                    Write-Log -Level INFO -Message "Added Podman Desktop public key to config file"
+                }
+            } else {
+                # Create new config file with the key
+                Set-Content -Path $configPath -Value "# Podman Desktop SSH Public Key`n$publicKeyContent`n"
+                Write-Log -Level INFO -Message "Created config file with Podman Desktop public key"
+            }
+        } catch {
+            Write-Log -Level WARNING -Message "Failed to update config file: $_"
+        }
+
+        # Update podman-win file
+        $podmanWinPath = Join-Path $ContainersDir 'podman-win'
+        try {
+            # If file exists, read it first
+            if (Test-Path $podmanWinPath) {
+                $podmanWinContent = Get-Content $podmanWinPath -Raw
+                # Only add the key if it doesn't already contain it
+                if ($podmanWinContent -notmatch [regex]::Escape($publicKeyContent)) {
+                    Add-Content -Path $podmanWinPath -Value "`n# Podman Desktop SSH Public Key`n$publicKeyContent`n"
+                    Write-Log -Level INFO -Message "Added Podman Desktop public key to podman-win file"
+                }
+            } else {
+                # Create new podman-win file with the key
+                Set-Content -Path $podmanWinPath -Value "# Podman Desktop SSH Public Key`n$publicKeyContent`n"
+                Write-Log -Level INFO -Message "Created podman-win file with Podman Desktop public key"
+            }
+        } catch {
+            Write-Log -Level WARNING -Message "Failed to update podman-win file: $_"
+        }
+    }
+
     return $publicKeyContent
 }
 
@@ -847,7 +867,8 @@ function Install-ContainerTools {
     if (-not $SSHPublicKey) {
         Write-Log -Level INFO -Message "No SSH public key provided, reading from Podman Desktop"
         try {
-            $SSHPublicKey = Get-PodmanDesktopPublicKey
+            # Update this line to also write the key to container config files
+            $SSHPublicKey = Get-PodmanDesktopPublicKey -UpdateContainerFiles $true
         }
         catch {
             Write-Log -Level ERROR -Message "Failed to read Podman Desktop public key: $($_.Exception.Message)"
@@ -1099,6 +1120,20 @@ try {
         Write-Log -Level INFO -Message "Deploying container configuration files to VM"
         $containersConfigDir = Join-Path $PSScriptRoot 'containers'
 
+        # Get Podman Desktop public key and update container files
+        Get-PodmanDesktopPublicKey -UpdateContainerFiles $true -ContainersDir $containersConfigDir
+
+        # Also copy the newly created/updated config and podman-win files
+        $configPath = Join-Path $containersConfigDir 'config'
+        if (Test-Path $configPath) {
+            Copy-ToVM -Src $configPath -Dest "/home/$($sshInfo.User)/.config/containers/config" -SSH $sshInfo
+        }
+
+        $podmanWinPath = Join-Path $containersConfigDir 'podman-win'
+        if (Test-Path $podmanWinPath) {
+            Copy-ToVM -Src $podmanWinPath -Dest "/home/$($sshInfo.User)/.config/containers/podman-win" -SSH $sshInfo
+        }
+
         # Copy auth.json to the proper location for container authentication
         $authJsonPath = Join-Path $containersConfigDir 'auth.json'
         if (Test-Path $authJsonPath) {
@@ -1178,7 +1213,6 @@ try {
     }
 
     Write-Log -Level SUCCESS -Message "Container environment setup completed successfully!"
-    Write-Log -Level INFO -Message "Log file: $global:LogFile"
 }
 catch {
     Write-Log -Level ERROR -Message "Setup failed: $_"
