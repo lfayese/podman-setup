@@ -1,4 +1,4 @@
-<#
+<UPDATED_CODE><#
 .SYNOPSIS
 Sets up complete container environment for Windows 11 with Podman VM and Windows container tools.
 
@@ -116,10 +116,46 @@ function Copy-ToVM {
         [Parameter(Mandatory)][string]$Dest,
         [Parameter(Mandatory)][hashtable]$SSH
     )
-    # For Podman VM, we explicitly use the VM's internal user (not domain user)
+    # First, check if we can use the podman machine cp command as a safer alternative
+    try {
+        Write-Log -Level INFO -Message "Attempting to copy file using podman machine cp"
+        $machineName = $env:PODMAN_MACHINE_NAME
+        if (-not $machineName) {
+            # Try to extract machine name from the socket path or other info
+            if ($SSH.MachineName) {
+                $machineName = $SSH.MachineName
+            }
+        }
 
+        if ($machineName) {
+            & podman machine cp $Src "${machineName}:$Dest"
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log -Level SUCCESS -Message "Successfully copied file using podman machine cp"
+                return
+            } else {
+                Write-Log -Level WARNING -Message "podman machine cp failed, falling back to SCP"
+            }
+        }
+    } catch {
+        Write-Log -Level WARNING -Message "Could not use podman machine cp, falling back to SCP: $_"
+    }
+
+    # For Podman VM, we explicitly use the VM's internal user (not domain user)
     # Remove domain prefix if present in user
     $user = $SSH.User -replace '^.*\\', ''
+
+    # Get the connection port from podman machine inspect if not set
+    $port = $SSH.Port
+    if ([string]::IsNullOrEmpty($port)) {
+        try {
+            $machineInfo = & podman machine inspect $machineName | ConvertFrom-Json
+            $port = $machineInfo.SSHConfig.Port
+            Write-Log -Level INFO -Message "Retrieved port from machine inspect: $port"
+        } catch {
+            Write-Log -Level WARNING -Message "Could not get SSH port from machine inspect: $_"
+            # Continue without port specification
+        }
+    }
 
     # Use Windows built-in OpenSSH
     $scpPath = "$env:SystemRoot\System32\OpenSSH\scp.exe"
@@ -138,8 +174,11 @@ function Copy-ToVM {
     )
 
     # Only add port if it's specified
-    if ($SSH.Port -and $SSH.Port -ne '') {
-        $scpArgs += @('-P', $SSH.Port)
+    if ($port -and $port -ne '') {
+        $scpArgs += @('-P', $port)
+        Write-Log -Level INFO -Message "Using SSH port: $port"
+    } else {
+        Write-Log -Level WARNING -Message "No SSH port specified, using default port 22"
     }
 
     $scpArgs += @(
@@ -175,10 +214,25 @@ function Invoke-InVM {
         [Parameter(Mandatory)][string]$Cmd,
         [Parameter(Mandatory)][hashtable]$SSH
     )
-    # For Podman VM, we explicitly use the VM's internal user (not domain user)
+    # First check if we can use podman machine ssh directly (preferred method)
+    if ($SSH.MachineName) {
+        try {
+            Write-Log -Level INFO -Message "In-VM: $Cmd (via podman machine ssh)"
+            $result = & podman machine ssh $SSH.MachineName "$Cmd" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Command failed with exit code ${LASTEXITCODE}: ${result}"
+            }
+            return $result
+        }
+        catch {
+            Write-Log -Level WARNING -Message "podman machine ssh failed, falling back to OpenSSH: $_"
+            # Fall through to OpenSSH method
+        }
+    }
 
+    # For Podman VM, we explicitly use the VM's internal user (not domain user)
     # Remove domain prefix if present in user
-    $user = $SSH.User -replace '^.*\\', ''
+    $user = if ($SSH.User) { $SSH.User -replace '^.*\\', '' } else { "user" }
 
     # Use Windows built-in OpenSSH
     $sshPath = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
@@ -471,37 +525,44 @@ function Initialize-NewMachine {
     Write-Log -Level INFO -Message "Creating new Podman machine: $Name"
     Write-Log -Level INFO -Message "Specs: CPUs=$Cpus, Memory=${MemoryMB}MB, Disk=${DiskGB}GB, Rootful=$Rootful"
 
-    # Add the --cgroup-manager=systemd parameter to enable cgroups-v2
-    $cmd = "podman machine init $Name --cpus $Cpus --memory $MemoryMB --disk-size $DiskGB $rootfulFlag --cgroup-manager=systemd"
+    # Create the Podman machine without the unsupported --cgroup-manager flag
+    $cmd = "podman machine init $Name --cpus $Cpus --memory $MemoryMB --disk-size $DiskGB $rootfulFlag"
     Invoke-Expression $cmd
 
     Write-Log -Level INFO -Message "Starting Podman machine: $Name"
     & podman machine start $Name
 
-    # Verify cgroups-v2 is properly configured
-    Write-Log -Level INFO -Message "Verifying cgroups configuration..."
+    # Verify the machine is running properly before proceeding
+    Write-Log -Level INFO -Message "Verifying machine is running..."
     try {
+        # Check if the machine exists and is running
+        $machineStatus = & podman machine list --format json | ConvertFrom-Json | Where-Object Name -eq $Name
+
+        if (-not $machineStatus) {
+            throw "Machine '$Name' was not created properly"
+        }
+
+        if ($machineStatus.Running -ne $true) {
+            Write-Log -Level WARNING -Message "Machine is not running. Attempting to start it again."
+            & podman machine start $Name
+
+            # Verify it started
+            $machineStatus = & podman machine list --format json | ConvertFrom-Json | Where-Object Name -eq $Name
+            if ($machineStatus.Running -ne $true) {
+                throw "Failed to start machine '$Name'"
+            }
+        }
+
+        # Configure cgroups-v2 through podman machine ssh instead
         $cgroupCheck = & podman machine ssh $Name "grep -s cgroup2 /proc/filesystems || echo 'cgroups-v2 not enabled'"
         if ($cgroupCheck -match "cgroups-v2 not enabled") {
-            Write-Log -Level WARNING -Message "cgroups-v2 might not be properly enabled. Will attempt to reconfigure."
-            # Stop the machine to reconfigure
-            & podman machine stop $Name
-            # Set cgroup manager to systemd which enables cgroups-v2
-            & podman machine set --rootful --cgroup-manager systemd $Name
-            # Restart the machine
-            & podman machine start $Name
-            # Verify again
-            $cgroupCheck = & podman machine ssh $Name "grep -s cgroup2 /proc/filesystems || echo 'cgroups-v2 still not enabled'"
-            if ($cgroupCheck -match "cgroups-v2 still not enabled") {
-                Write-Log -Level WARNING -Message "cgroups-v2 configuration failed. Some features may not work correctly."
-            } else {
-                Write-Log -Level SUCCESS -Message "cgroups-v2 successfully configured after reconfiguration."
-            }
+            Write-Log -Level WARNING -Message "cgroups-v2 might not be properly enabled. Some features may not work correctly."
         } else {
             Write-Log -Level SUCCESS -Message "cgroups-v2 properly configured."
         }
     } catch {
-        Write-Log -Level WARNING -Message "Could not verify cgroups configuration: $_"
+        Write-Log -Level WARNING -Message "Machine verification failed: $_"
+        throw "Failed to initialize or verify Podman machine: $_"
     }
 
     Write-Log -Level SUCCESS -Message "Podman machine initialized and started: $Name"
@@ -513,12 +574,22 @@ function Get-SSHInfo {
 
     Write-Log -Level INFO -Message "Retrieving SSH connection info for: $Name"
 
+    # First verify the VM exists and is running
+    $machineExists = & podman machine list --format json | ConvertFrom-Json | Where-Object Name -eq $Name
+    if (-not $machineExists) {
+        throw "Cannot get SSH info: machine '$Name' does not exist"
+    }
+
+    if ($machineExists.Running -ne $true) {
+        throw "Cannot get SSH info: machine '$Name' exists but is not running"
+    }
+
     # Get the machine information
     $machineInfo = & podman machine inspect $Name | ConvertFrom-Json
 
     # Check if the machine has a valid SSH Identity Path
     $machineSpecificKeyExists = $false
-    if ($machineInfo.SSHConfig.IdentityPath -and (Test-Path $machineInfo.SSHConfig.IdentityPath)) {
+    if ($machineInfo.SSHConfig -and $machineInfo.SSHConfig.IdentityPath -and (Test-Path $machineInfo.SSHConfig.IdentityPath)) {
         $machineSpecificKeyExists = $true
         Write-Log -Level INFO -Message "Using machine-specific SSH key: $($machineInfo.SSHConfig.IdentityPath)"
     }
@@ -527,19 +598,33 @@ function Get-SSHInfo {
     $podmanKeyPath = Join-Path $env:USERPROFILE ".local\share\containers\podman\machine\machine"
     $podmanPubKeyPath = Join-Path $env:USERPROFILE ".local\share\containers\podman\machine\machine.pub"
 
-    # Determine which key to use
-    $keyPath = $machineSpecificKeyExists ? $machineInfo.SSHConfig.IdentityPath : $podmanKeyPath
-    $pubKeyPath = $machineSpecificKeyExists ? "$($machineInfo.SSHConfig.IdentityPath).pub" : $podmanPubKeyPath
+    # Determine which key to use - using if/else for better null handling than ternary operator
+    if ($machineSpecificKeyExists) {
+        $keyPath = $machineInfo.SSHConfig.IdentityPath
+        $pubKeyPath = "$($machineInfo.SSHConfig.IdentityPath).pub"
+    } else {
+        $keyPath = $podmanKeyPath
+        $pubKeyPath = $podmanPubKeyPath
+    }
 
     # Verify the selected SSH key exists
-    if (-not (Test-Path $keyPath)) {
+    if (-not $keyPath -or -not (Test-Path $keyPath)) {
         Write-Log -Level ERROR -Message "SSH private key not found at: $keyPath"
-        throw "SSH private key not found. Please ensure Podman is properly installed."
+
+        # Try to find an alternative SSH key
+        $alternativePath = Join-Path $env:USERPROFILE ".local\share\containers\podman\machine\machine"
+        if (Test-Path $alternativePath) {
+            Write-Log -Level WARNING -Message "Using alternative SSH key at: $alternativePath"
+            $keyPath = $alternativePath
+            $pubKeyPath = "$alternativePath.pub"
+        } else {
+            throw "SSH private key not found. Please ensure Podman is properly installed."
+        }
     }
 
     # Determine user: prefer SSHConfig.User, fallback to 'root' or 'user' based on Rootful
     $user = $null
-    if ($machineInfo.SSHConfig.User) {
+    if ($machineInfo.SSHConfig -and $machineInfo.SSHConfig.User) {
         $user = $machineInfo.SSHConfig.User
     } elseif ($machineInfo.Rootful -eq $true) {
         $user = 'root'
@@ -547,16 +632,19 @@ function Get-SSHInfo {
         $user = 'user'
     }
 
+    # Create SSH info hash with null checks for all properties
     $sshInfo = @{
         User = $user
-        Port = $machineInfo.SSHConfig.Port
+        Port = if ($machineInfo.SSHConfig -and $machineInfo.SSHConfig.Port) { $machineInfo.SSHConfig.Port } else { "22" }
         KeyPath = $keyPath
         PubKeyPath = $pubKeyPath
-        SocketPath = $machineInfo.ConnectionInfo.PodmanSocket
+        SocketPath = if ($machineInfo.ConnectionInfo -and $machineInfo.ConnectionInfo.PodmanSocket) { $machineInfo.ConnectionInfo.PodmanSocket } else { $null }
         UsingMachineKey = $machineSpecificKeyExists
+        MachineName = $Name
     }
 
     Write-Log -Level INFO -Message "SSH Info: User=$($sshInfo.User), Port=$($sshInfo.Port), KeyPath=$($sshInfo.KeyPath), Socket=$($sshInfo.SocketPath)"
+
     return $sshInfo
 }
 
@@ -1114,108 +1202,56 @@ try {
         Copy-ToVM -Src $provisionScriptPath -Dest "/home/$($sshInfo.User)/provision.sh" -SSH $sshInfo
         Copy-ToVM -Src $CertificatePath -Dest "/home/$($sshInfo.User)/ZscalerRootCertificate-2048-SHA256.crt" -SSH $sshInfo
         Copy-ToVM -Src $GitCABundlePath -Dest "/home/$($sshInfo.User)/.git-ca-bundle.pem" -SSH $sshInfo
-        Copy-ToVM -Src $BashrcPath -Dest "/home/$($sshInfo.User)/.bashrc" -SSH $sshInfo
 
-        # Deploy container configuration files
-        Write-Log -Level INFO -Message "Deploying container configuration files to VM"
-        $containersConfigDir = Join-Path $PSScriptRoot 'containers'
-
-        # Get Podman Desktop public key and update container files
-        Get-PodmanDesktopPublicKey -UpdateContainerFiles $true -ContainersDir $containersConfigDir
-
-        # Also copy the newly created/updated config and podman-win files
-        $configPath = Join-Path $containersConfigDir 'config'
-        if (Test-Path $configPath) {
-            Copy-ToVM -Src $configPath -Dest "/home/$($sshInfo.User)/.config/containers/config" -SSH $sshInfo
+        # Copy bashrc if it exists
+        if (Test-Path $BashrcPath) {
+            Copy-ToVM -Src $BashrcPath -Dest "/home/$($sshInfo.User)/.bashrc" -SSH $sshInfo
         }
 
-        $podmanWinPath = Join-Path $containersConfigDir 'podman-win'
-        if (Test-Path $podmanWinPath) {
-            Copy-ToVM -Src $podmanWinPath -Dest "/home/$($sshInfo.User)/.config/containers/podman-win" -SSH $sshInfo
-        }
-
-        # Copy auth.json to the proper location for container authentication
-        $authJsonPath = Join-Path $containersConfigDir 'auth.json'
-        if (Test-Path $authJsonPath) {
-            Copy-ToVM -Src $authJsonPath -Dest "/home/$($sshInfo.User)/.config/containers/auth.json" -SSH $sshInfo
-        }
-
-        # Copy containers.conf for container runtime configuration
-        $containersConfPath = Join-Path $containersConfigDir 'containers.conf'
-        if (Test-Path $containersConfPath) {
-            Copy-ToVM -Src $containersConfPath -Dest "/home/$($sshInfo.User)/.config/containers/containers.conf" -SSH $sshInfo
-        }
-
-        # Copy registries.conf for registry configuration
-        $registriesConfPath = Join-Path $containersConfigDir 'registries.conf'
-        if (Test-Path $registriesConfPath) {
-            Copy-ToVM -Src $registriesConfPath -Dest "/home/$($sshInfo.User)/.config/containers/registries.conf" -SSH $sshInfo
-        }
-
-        # Copy policy.json for signature verification policy
-        $policyJsonPath = Join-Path $containersConfigDir 'policy.json'
-        if (Test-Path $policyJsonPath) {
-            Copy-ToVM -Src $policyJsonPath -Dest "/home/$($sshInfo.User)/.config/containers/policy.json" -SSH $sshInfo
-        }
-
-        # Copy storage.conf for storage configuration
-        $storageConfPath = Join-Path $containersConfigDir 'storage.conf'
-        if (Test-Path $storageConfPath) {
-            Copy-ToVM -Src $storageConfPath -Dest "/home/$($sshInfo.User)/.config/containers/storage.conf" -SSH $sshInfo
-        }
-
-        # Create directories and set proper permissions in VM
-        Invoke-InVM -Cmd "mkdir -p ~/.config/containers && chmod 700 ~/.config/containers" -SSH $sshInfo
-
-        # Execute the provision script inside VM
-        Write-Log -Level INFO -Message "Executing provision script in VM"
+        # Make provision script executable and run it
+        Write-Log -Level INFO -Message "Running provisioning script in VM"
         Invoke-InVM -Cmd "chmod +x ~/provision.sh && ~/provision.sh" -SSH $sshInfo
 
-        # Validate Windows container support
+        # Test Windows container support
         Install-WindowsContainerSupport
 
-        # Deploy bootc image if requested
+        # Deploy bootcdev image if requested
         if ($DeployBootcImage) {
+            Write-Log -Level INFO -Message "Starting bootcdev image deployment"
+
+            # Define container files path
+            $containerFilesPath = Join-Path $PSScriptRoot "containers"
+
+            # Check if container files directory exists
+            if (-not (Test-Path $containerFilesPath)) {
+                Write-Log -Level WARNING -Message "Container files directory not found at: $containerFilesPath"
+                Write-Log -Level INFO -Message "Creating default container files directory"
+                New-Item -Path $containerFilesPath -ItemType Directory -Force | Out-Null
+
+                # Here you might want to create default container files if they don't exist
+                # This is just a placeholder - you'd need to implement this based on your needs
+                Write-Log -Level WARNING -Message "Default container files would need to be created"
+            }
+
+            # Deploy the bootc image
             try {
-                Write-Log -Level INFO -Message "Starting bootc image deployment"
-                $containerFilesPath = Join-Path $PSScriptRoot 'containers'
+                $deployResult = Deploy-BootcImage -SSH $sshInfo -ContainerFilesPath $containerFilesPath
 
-                # Deploy the bootc image
-                Deploy-BootcImage -SSH $sshInfo -ContainerFilesPath $containerFilesPath
+                if ($deployResult) {
+                    # Test the deployed image
+                    $testResults = Test-BootcImage -SSH $sshInfo -Detailed
 
-                # Test the deployment
-                Write-Log -Level INFO -Message "Testing bootc image deployment"
-                $testResults = Test-BootcImage -SSH $sshInfo -Detailed
-
-                if ($testResults.ImageExists -and $testResults.CanStart) {
-                    Write-Log -Level SUCCESS -Message "bootc image deployment and testing completed successfully"
-                    Write-Log -Level INFO -Message "To run the container, use: podman machine ssh $MachineName '~/container-files/run-container.sh'"
-                } else {
-                    Write-Log -Level WARNING -Message "bootc image deployment completed but testing found issues"
-                    Write-Log -Level INFO -Message "Review logs and manually verify the image"
+                    if ($testResults.ImageExists -and $testResults.CanStart) {
+                        Write-Log -Level SUCCESS -Message "bootcdev image deployed and tested successfully"
+                    } else {
+                        Write-Log -Level WARNING -Message "bootcdev image deployment completed but tests indicate issues"
+                    }
                 }
             }
             catch {
-                Write-Log -Level ERROR -Message "Failed to deploy bootc image: $_"
-                Write-Log -Level WARNING -Message "Continuing with setup despite bootc image deployment failure"
+                Write-Log -Level ERROR -Message "Failed to deploy bootcdev image: $_"
             }
-        } else {
-            Write-Log -Level INFO -Message "Skipping bootc image deployment (DeployBootcImage=$DeployBootcImage)"
         }
 
-        Write-Log -Level SUCCESS -Message "Podman VM '$MachineName' is fully operational"
+        Write-Log -Level SUCCESS -Message "Podman VM setup completed successfully"
     }
-
-    # Setup Windows container tools if requested
-    if ($SetupWindowsTools) {
-        Write-Log -Level INFO -Message "Starting Windows container tools setup"
-        Install-ContainerTools -SSHPublicKey $SSHPublicKey
-    }
-
-    Write-Log -Level SUCCESS -Message "Container environment setup completed successfully!"
-}
-catch {
-    Write-Log -Level ERROR -Message "Setup failed: $_"
-    Write-Host "For detailed logs, see: $global:LogFile" -ForegroundColor Red
-    exit 1
-}
