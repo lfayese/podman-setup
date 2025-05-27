@@ -1,4 +1,4 @@
-<UPDATED_CODE><#
+<#
 .SYNOPSIS
 Sets up complete container environment for Windows 11 with Podman VM and Windows container tools.
 
@@ -53,6 +53,21 @@ Param(
 # Global logfile
 $global:LogFile = Join-Path $env:TEMP ("container-setup-{0:yyyyMMdd-HHmmss}-{1}.log" -f (Get-Date), ([guid]::NewGuid()))
 
+# Global script variables
+### Remove duplicate global script variables
+$script:MaxRetries = 3
+$script:RetryDelaySeconds = 5
+$script:DevRoot = 'C:\devtools'
+$script:ContainerdVersion = '2.1.0'
+$script:Arch = 'amd64'
+$script:CniPluginVersion = '1.7.1'
+$script:NerdctlVersion = '2.1.1'
+$script:CriToolsVersion = '1.33.0'
+# Ensure script variables for retries are initialized at the top level for later use
+if (-not $script:MaxRetries)       { $script:MaxRetries = $MaxRetries }
+if (-not $script:RetryDelaySeconds){ $script:RetryDelaySeconds = $RetryDelaySeconds }
+if (-not $script:DevRoot)          { $script:DevRoot = 'C:\devtools' } # Used by downline functions
+
 #--- LOGGING & UTILITIES -----------------------------------------------------
 function Write-Log {
     [CmdletBinding()] Param(
@@ -80,10 +95,15 @@ function Invoke-WithRetry {
     [CmdletBinding()] Param(
         [scriptblock]$ScriptBlock,
         [string]$ActionName = 'Operation',
-        [int]$MaxRetries = $script:MaxRetries,
-        [int]$DelaySeconds = $script:RetryDelaySeconds,
+        [int]$MaxRetries = 3,
+        [int]$DelaySeconds = 5,
         [object[]]$ArgumentList
     )
+
+    # Use script variables if not provided explicitly
+    if (-not $MaxRetries -or $MaxRetries -eq 0) { $MaxRetries = $script:MaxRetries }
+    if (-not $DelaySeconds -or $DelaySeconds -eq 0) { $DelaySeconds = $script:RetryDelaySeconds }
+
     for ($i=1; $i -le $MaxRetries; $i++) {
         try {
             Write-Log -Level INFO -Message "$ActionName (Attempt $i/$MaxRetries)"
@@ -98,7 +118,6 @@ function Invoke-WithRetry {
         }
     }
 }
-
 function Add-ToPath {
     [CmdletBinding()] Param([Parameter(Mandatory)][string]$Entry)
     $mp = [Environment]::GetEnvironmentVariable('Path','Machine')
@@ -106,8 +125,7 @@ function Add-ToPath {
         [Environment]::SetEnvironmentVariable('Path', "$mp;$Entry", 'Machine')
         Write-Log -Level INFO -Message "Injected $Entry into Machine PATH."
     }
-    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
-        [Environment]::GetEnvironmentVariable('Path','User')
+    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 }
 
 function Copy-ToVM {
@@ -126,7 +144,6 @@ function Copy-ToVM {
                 $machineName = $SSH.MachineName
             }
         }
-
         if ($machineName) {
             & podman machine cp $Src "${machineName}:$Dest"
             if ($LASTEXITCODE -eq 0) {
@@ -169,18 +186,13 @@ function Copy-ToVM {
     }
 
     # The port argument for scp is capital -P
-    $scpArgs = @(
-        '-i', $SSH.KeyPath
-    )
-
-    # Only add port if it's specified
+    $scpArgs = @('-i', $SSH.KeyPath)
     if ($port -and $port -ne '') {
         $scpArgs += @('-P', $port)
         Write-Log -Level INFO -Message "Using SSH port: $port"
     } else {
         Write-Log -Level WARNING -Message "No SSH port specified, using default port 22"
     }
-
     $scpArgs += @(
         '-o', 'UserKnownHostsFile=/dev/null',
         '-o', 'StrictHostKeyChecking=no',
@@ -188,16 +200,13 @@ function Copy-ToVM {
         '-o', 'IdentitiesOnly=yes',
         '-o', 'PasswordAuthentication=no',
         '-o', 'BatchMode=yes',
-        # Silence warnings about adding hosts to known_hosts
         '-o', 'LogLevel=ERROR',
         $Src
     )
-
-    # Use 127.0.0.1 instead of localhost for more reliable connections
     $scpArgs += "$user@127.0.0.1:$Dest"
 
     try {
-        Write-Log -Level INFO -Message "Copy '$Src' (Attempt 1/$MaxRetries)"
+        Write-Log -Level INFO -Message "Copy '$Src' (Attempt 1/$script:MaxRetries)"
         & $scpPath @scpArgs
         if ($LASTEXITCODE -ne 0) {
             throw "SCP command failed with exit code $LASTEXITCODE"
@@ -297,7 +306,11 @@ function Invoke-DownloadAndExtract {
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][ValidateSet('tar','zip')][string]$Format
     )
-    $file = Join-Path $DevRoot ([IO.Path]::GetFileName($Url))
+    # Ensure DevRoot is initialized
+    if (-not $script:DevRoot) {
+        $script:DevRoot = 'C:\devtools'
+    }
+    $file = Join-Path $script:DevRoot ([IO.Path]::GetFileName($Url))
     Write-Log -Level INFO -Message "Downloading $Url"
     Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $file
     Write-Log -Level INFO -Message "Extracting to $Destination"
@@ -964,13 +977,13 @@ function Install-ContainerTools {
         }
     }
 
-    # Define global variables for Windows container tools
-    $script:DevRoot = 'C:\devtools'
-    $script:ContainerdVersion = '2.1.0'
-    $script:Arch = 'amd64'
-    $script:CniPluginVersion = '1.7.1'
-    $script:NerdctlVersion = '2.1.1'
-    $script:CriToolsVersion = '1.33.0'
+    # Define or ensure global variables for Windows container tools
+    if (-not $script:DevRoot) { $script:DevRoot = 'C:\devtools' }
+    if (-not $script:ContainerdVersion) { $script:ContainerdVersion = '2.1.0' }
+    if (-not $script:Arch) { $script:Arch = 'amd64' }
+    if (-not $script:CniPluginVersion) { $script:CniPluginVersion = '1.7.1' }
+    if (-not $script:NerdctlVersion) { $script:NerdctlVersion = '2.1.1' }
+    if (-not $script:CriToolsVersion) { $script:CriToolsVersion = '1.33.0' }
 
     Write-Log -Level INFO -Message "Starting Windows container tools installation"
 
@@ -978,7 +991,7 @@ function Install-ContainerTools {
     Write-Log -Level INFO -Message 'Enabling Containers and Hyper-V features'
     Enable-WindowsOptionalFeature -Online -FeatureName Containers,Microsoft-Hyper-V -All | Out-Null
 
-    New-Item -Path $DevRoot -ItemType Directory -Force | Out-Null
+    New-Item -Path $script:DevRoot -ItemType Directory -Force | Out-Null
 
     # Install containerd
     Install-Containerd
@@ -1002,10 +1015,10 @@ function Install-Containerd {
     Write-Log -Level INFO -Message "Installing containerd v$ContainerdVersion"
     Stop-Service containerd -ErrorAction SilentlyContinue
 
-    $cdPath = Join-Path $DevRoot 'containerd'
+    $cdPath = Join-Path $script:DevRoot 'containerd'
     New-Item -Path $cdPath -ItemType Directory -Force | Out-Null
 
-    $cdUrl = "https://github.com/containerd/containerd/releases/download/v$ContainerdVersion/containerd-$ContainerdVersion-windows-$Arch.tar.gz"
+    $cdUrl = "https://github.com/containerd/containerd/releases/download/v$ContainerdVersion/containerd-$ContainerdVersion-windows-$script:Arch.tar.gz"
     Invoke-DownloadAndExtract -Url $cdUrl -Destination $cdPath -Format tar
 
     Add-ToPath -Entry "$cdPath\bin"
@@ -1021,12 +1034,12 @@ function Install-Containerd {
 
 function Install-CniPlugins {
     Write-Log -Level INFO -Message "Installing CNI plugins v$CniPluginVersion"
-    $cdPath = Join-Path $DevRoot 'containerd'
+    $cdPath = Join-Path $script:DevRoot 'containerd'
     $cniBin = Join-Path $cdPath 'cni\bin'
     $cniConf = Join-Path $cdPath 'cni\conf'
     New-Item -Path $cniBin,$cniConf -ItemType Directory -Force | Out-Null
 
-    $cniUrl = "https://github.com/containernetworking/plugins/releases/download/v$CniPluginVersion/cni-plugins-windows-$Arch-v$CniPluginVersion.tgz"
+    $cniUrl = "https://github.com/containernetworking/plugins/releases/download/v$CniPluginVersion/cni-plugins-windows-$script:Arch-v$CniPluginVersion.tgz"
     Invoke-DownloadAndExtract -Url $cniUrl -Destination $cniBin -Format tar
 
     $network = 'nat'
@@ -1062,12 +1075,12 @@ function Install-CniPlugins {
 
 function Install-ContainerCliTools {
     foreach ($tool in @(
-        @{ Name = 'nerdctl'; Ver = $NerdctlVersion; Url = "https://github.com/containerd/nerdctl/releases/download/v$NerdctlVersion/nerdctl-$NerdctlVersion-windows-$Arch.tar.gz" },
-        @{ Name = 'crictl'; Ver = $CriToolsVersion; Url = "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$CriToolsVersion/crictl-v$CriToolsVersion-windows-$Arch.tar.gz" },
-        @{ Name = 'critest'; Ver = $CriToolsVersion; Url = "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$CriToolsVersion/critest-v$CriToolsVersion-windows-$Arch.tar.gz" }
+        @{ Name = 'nerdctl'; Ver = $script:NerdctlVersion; Url = "https://github.com/containerd/nerdctl/releases/download/v$script:NerdctlVersion/nerdctl-$script:NerdctlVersion-windows-$script:Arch.tar.gz" },
+        @{ Name = 'crictl'; Ver = $script:CriToolsVersion; Url = "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$script:CriToolsVersion/crictl-v$script:CriToolsVersion-windows-$script:Arch.tar.gz" },
+        @{ Name = 'critest'; Ver = $script:CriToolsVersion; Url = "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$script:CriToolsVersion/critest-v$script:CriToolsVersion-windows-$script:Arch.tar.gz" }
     )) {
         Write-Log -Level INFO -Message "Installing $($tool.Name) v$($tool.Ver)"
-        $dest = Join-Path $DevRoot $tool.Name
+        $dest = Join-Path $script:DevRoot $tool.Name
         New-Item -Path $dest -ItemType Directory -Force | Out-Null
         Invoke-DownloadAndExtract -Url $tool.Url -Destination $dest -Format tar
         Add-ToPath -Entry $dest
@@ -1077,15 +1090,17 @@ function Install-ContainerCliTools {
 function Install-BuildKit {
     Write-Log -Level INFO -Message 'Installing BuildKit'
     $bkApi = 'https://api.github.com/repos/moby/buildkit/releases/latest'
-    $bkTag = (Invoke-RestMethod -Uri $bkApi -UseBasicParsing).tag_name.TrimStart('v')
-    $bkUrl = "https://github.com/moby/buildkit/releases/download/v$bkTag/buildkit-v$bkTag.windows-$Arch.tar.gz"
-    $bkRoot = Join-Path $DevRoot 'buildkit'
+    $bkRelease = Invoke-RestMethod -Uri $bkApi -UseBasicParsing
+    $bkTag = $bkRelease.tag_name
+    if ($bkTag -like 'v*') { $bkTag = $bkTag.TrimStart('v') }
+    $bkUrl = "https://github.com/moby/buildkit/releases/download/v$bkTag/buildkit-v$bkTag.windows-$script:Arch.tar.gz"
+    $bkRoot = Join-Path $script:DevRoot 'buildkit'
     New-Item -Path $bkRoot -ItemType Directory -Force | Out-Null
 
     Invoke-DownloadAndExtract -Url $bkUrl -Destination $bkRoot -Format tar
     Add-ToPath -Entry $bkRoot
 
-    $cdPath = Join-Path $DevRoot 'containerd'
+    $cdPath = Join-Path $script:DevRoot 'containerd'
     $cniBin = Join-Path $cdPath 'cni\bin'
     $cniConf = Join-Path $cdPath 'cni\conf'
     $confFile = Join-Path $cniConf "0-containerd-nat.conf"
@@ -1255,3 +1270,24 @@ try {
 
         Write-Log -Level SUCCESS -Message "Podman VM setup completed successfully"
     }
+
+    # Setup Windows container tools if requested
+    if ($SetupWindowsTools) {
+        Write-Log -Level INFO -Message "Starting Windows container tools setup"
+        Install-ContainerTools -SSHPublicKey $SSHPublicKey
+        Write-Log -Level SUCCESS -Message "Windows container tools setup completed successfully"
+    }
+}
+catch {
+    Write-Log -Level ERROR -Message "Container setup failed with error: $_"
+    throw "Container setup failed: $_"
+}
+finally {
+    Write-Log -Level INFO -Message "Container environment setup process completed at $(Get-Date)"
+    Write-Log -Level INFO -Message "Log file: $global:LogFile"
+}
+
+# Add an explicit main entry marker, so script can be dot-sourced without side effects
+if ($MyInvocation.InvocationName -eq '.') {
+    return
+}
