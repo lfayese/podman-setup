@@ -1,0 +1,26 @@
+[[customizations.user]]
+name = "root"
+password = ""
+key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIysV4YtgxXwdhhxygxDQckr7HGv8ePpUrUVtuNyPVVm"
+groups = ["wheel"]
+
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "10 GiB"
+
+[[customizations.filesystem]]
+mountpoint = "/var/data"
+minsize = "20 GiB"
+
+[customizations.services]
+enabled = ["sshd", "nginx"]
+disabled = ["firewalld"]
+
+[customizations.installer.kickstart]
+contents = """
+text --non-interactive
+zerombr
+clearpart --all --initlabel --disklabel=gpt
+autopart --noswap --type=lvm
+network --bootproto=dhcp --device=link --activate --onboot=on
+"""

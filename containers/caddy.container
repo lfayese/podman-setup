@@ -1,0 +1,10 @@
+[Unit]
+Description=Run a demo webserver
+
+[Container]
+Image=docker.io/library/caddy
+PublishPort=80:80
+AutoUpdate=registry
+
+[Install]
+WantedBy=default.target
