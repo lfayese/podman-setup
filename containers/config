@@ -1,6 +1,6 @@
 Host podman-win
     HostName 127.0.0.1
-    Port 62204
+    Port 59146
     User root
     IdentityFile ~/.ssh/podman-win
     StrictHostKeyChecking no

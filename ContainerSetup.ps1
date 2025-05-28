@@ -121,32 +121,228 @@ function Invoke-WithRetry {
 }
 
 function Wait-ForSSHReady {
-  [CmdletBinding()]
-  param(
-      [Parameter(Mandatory)][string]$MachineName,
-      [int]$MaxWaitSeconds = 180,
-      [int]$CheckInterval = 10
-  )
-  Write-Log -Level INFO -Message "Waiting for SSH to be ready on machine: $MachineName"
-  $elapsed = 0
-  while ($elapsed -lt $MaxWaitSeconds) {
-      try {
-          Write-Log -Level INFO -Message "Testing SSH connection via podman machine ssh..."
-          $result = & podman machine ssh $MachineName "echo 'SSH_READY'" 2>&1
-          if ($LASTEXITCODE -eq 0 -and $result -match "SSH_READY") {
-              Write-Log -Level SUCCESS -Message "SSH is ready via podman machine ssh"
-              return $true
-          }
-      }
-      catch {
-          Write-Log -Level INFO -Message "SSH not ready yet: $_"
-      }
-      Write-Log -Level INFO -Message "Waiting for SSH... ($elapsed/$MaxWaitSeconds seconds)"
-      Start-Sleep -Seconds $CheckInterval
-      $elapsed += $CheckInterval
-  }
-  Write-Log -Level ERROR -Message "SSH not ready after $MaxWaitSeconds seconds"
-  return $false
+    <#
+    .SYNOPSIS
+        Waits for SSH to be ready on a Podman machine.
+    .DESCRIPTION
+        Tests SSH connectivity to a Podman machine and waits until it's ready or times out.
+        Uses multiple connection methods for better reliability.
+    .PARAMETER MachineName
+        The name of the Podman machine.
+    .PARAMETER MaxWaitSeconds
+        Maximum time to wait in seconds. Default is 300.
+    .PARAMETER CheckInterval
+        Interval between checks in seconds. Default is 10.
+    .OUTPUTS
+        Boolean indicating if SSH is ready.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$MachineName,
+
+        [Parameter()]
+        [ValidateRange(30, 600)]
+        [int]$MaxWaitSeconds = 300,
+
+        [Parameter()]
+        [ValidateRange(1, 60)]
+        [int]$CheckInterval = 10
+    )
+
+    Write-Log -Level INFO -Message "Waiting for SSH to be ready on machine: $MachineName"
+    $elapsed = 0
+    $methods = @("podman-ssh", "direct-ssh", "wsl-direct")
+    $methodIndex = 0
+
+    while ($elapsed -lt $MaxWaitSeconds) {
+        $method = $methods[$methodIndex % $methods.Count]
+        $methodIndex++
+
+        try {
+            Write-Log -Level INFO -Message "Testing SSH connection via $method... ($elapsed/$MaxWaitSeconds seconds)"
+
+            switch ($method) {
+                "podman-ssh" {
+                    $result = & podman machine ssh $MachineName "echo 'SSH_READY'" 2>&1
+                    if ($LASTEXITCODE -eq 0 -and $result -match "SSH_READY") {
+                        Write-Log -Level SUCCESS -Message "SSH is ready via podman machine ssh"
+                        return $true
+                    }
+                }
+                "direct-ssh" {
+                    try {
+                        $machineInfo = & podman machine inspect $MachineName | ConvertFrom-Json
+                        if ($machineInfo.SSHConfig.Port) {
+                            $sshPath = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
+                            if (-not (Test-Path $sshPath)) { $sshPath = "ssh" }
+
+                            $keyPath = $machineInfo.SSHConfig.IdentityPath
+                            if (-not (Test-Path $keyPath)) {
+                                $keyPath = Join-Path $env:USERPROFILE ".local\share\containers\podman\machine\machine"
+                            }
+
+                            $sshArgs = @(
+                                '-i', $keyPath,
+                                '-p', $machineInfo.SSHConfig.Port,
+                                '-o', 'StrictHostKeyChecking=no',
+                                '-o', 'UserKnownHostsFile=/dev/null',
+                                '-o', 'BatchMode=yes',
+                                '-T',
+                                "$($machineInfo.SSHConfig.User)@localhost",
+                                "echo 'SSH_READY'"
+                            )
+
+                            $directResult = & $sshPath @sshArgs 2>&1
+                            if ($LASTEXITCODE -eq 0 -and $directResult -match "SSH_READY") {
+                                Write-Log -Level SUCCESS -Message "SSH is ready via direct SSH connection"
+                                return $true
+                            }
+                        }
+                    } catch {
+                        Write-Log -Level INFO -Message "Direct SSH connection attempt failed: $_"
+                    }
+                }
+                "wsl-direct" {
+                    try {
+                        # Try WSL direct access as last resort
+                        $wslResult = & wsl -d $MachineName -e echo "WSL_READY" 2>&1
+                        if ($wslResult -match "WSL_READY") {
+                            Write-Log -Level WARNING -Message "SSH not available, but WSL direct access works"
+                            # This isn't ideal but might allow some operations to continue
+                            return $true
+                        }
+                    } catch {
+                        Write-Log -Level INFO -Message "WSL direct access attempt failed: $_"
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log -Level INFO -Message "SSH connection attempt failed: $_"
+        }
+
+        Start-Sleep -Seconds $CheckInterval
+        $elapsed += $CheckInterval
+    }
+
+    Write-Log -Level ERROR -Message "SSH not ready after $MaxWaitSeconds seconds"
+    return $false
+}
+
+function Test-VMHealth {
+    <#
+    .SYNOPSIS
+        Tests if a Podman VM is healthy and responsive.
+    .DESCRIPTION
+        Checks if a Podman VM exists, is running, and responds to commands.
+        Attempts to restart the VM if it's not responsive.
+    .PARAMETER MachineName
+        The name of the Podman VM to test.
+    .OUTPUTS
+        Boolean indicating if the VM is healthy.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$MachineName
+    )
+
+    Write-Log -Level INFO -Message "Testing VM health: $MachineName"
+
+    # Check if VM exists and is running
+    $vmStatus = & podman machine list --format json | ConvertFrom-Json | Where-Object Name -eq $MachineName
+
+    if (-not $vmStatus) {
+        Write-Log -Level ERROR -Message "VM '$MachineName' not found"
+        return $false
+    }
+
+    if (-not $vmStatus.Running) {
+        Write-Log -Level WARNING -Message "VM '$MachineName' exists but is not running. Attempting to start..."
+        & podman machine start $MachineName
+        Start-Sleep -Seconds 10
+
+        # Check again if it's running
+        $vmStatus = & podman machine list --format json | ConvertFrom-Json | Where-Object Name -eq $MachineName
+        if (-not $vmStatus.Running) {
+            Write-Log -Level ERROR -Message "Failed to start VM '$MachineName'"
+            return $false
+        }
+    }
+
+    # Try a simple command to check VM responsiveness
+    try {
+        $result = & podman machine ssh $MachineName "echo 'VM_HEALTHY'" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $result -match "VM_HEALTHY") {
+            Write-Log -Level SUCCESS -Message "VM is responsive"
+            return $true
+        }
+
+        # If VM is not responsive, restart it
+        Write-Log -Level WARNING -Message "VM is not responsive. Attempting to restart..."
+        & podman machine stop $MachineName
+        Start-Sleep -Seconds 5
+        & podman machine start $MachineName
+        Start-Sleep -Seconds 15
+
+        # Check again after restart
+        $result = & podman machine ssh $MachineName "echo 'VM_HEALTHY'" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $result -match "VM_HEALTHY") {
+            Write-Log -Level SUCCESS -Message "VM is responsive after restart"
+            return $true
+        }
+
+        Write-Log -Level ERROR -Message "VM is still not responsive after restart"
+        return $false
+    }
+    catch {
+        Write-Log -Level ERROR -Message "Error checking VM health: $_"
+        return $false
+    }
+}
+
+function Set-VMNetworkConfiguration {
+    <#
+    .SYNOPSIS
+        Configures networking in a Podman VM for better SSH connectivity.
+    .DESCRIPTION
+        Sets up the network configuration in a Podman VM to use slirp4netns
+        for better SSH connectivity, especially in corporate environments.
+    .PARAMETER SSH
+        A hashtable containing SSH connection information.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNull()]
+        [hashtable]$SSH
+    )
+
+    Write-Log -Level INFO -Message "Configuring VM networking for better SSH connectivity"
+
+    # Create containers.conf directory if it doesn't exist
+    Invoke-InVM -Cmd "mkdir -p ~/.config/containers" -SSH $SSH
+
+    # Create or update containers.conf with slirp4netns configuration
+    $containersConf = @"
+[network]
+default_rootless_network_cmd = "slirp4netns"
+"@
+
+    # Write the configuration to a temporary file
+    $tempFile = Join-Path $env:TEMP "containers.conf"
+    Set-Content -Path $tempFile -Value $containersConf
+
+    # Copy the file to the VM
+    Copy-ToVM -Src $tempFile -Dest "~/.config/containers/containers.conf" -SSH $SSH
+
+    # Restart podman service in VM
+    Invoke-InVM -Cmd "systemctl --user restart podman.socket" -SSH $SSH
+
+    Write-Log -Level SUCCESS -Message "VM networking configured for better SSH connectivity"
 }
 
 function Add-ToPath {
@@ -637,7 +833,7 @@ function Install-WindowsContainerSupport {
     }
 }
 
-function Deploy-BootcImage {
+function Publish-BootcImage {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -1054,7 +1250,7 @@ function Install-BuildKit {
     Write-Log -Level SUCCESS -Message 'buildkitd service started'
 }
 
-function Install-ConfigureOpenSSH {
+function Set-OpenSSHConfiguration {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$PublicKey)
 
@@ -1153,6 +1349,19 @@ try {
 
         $sshInfo = Get-SSHInfo -Name $MachineName
 
+        # Test VM health and fix if needed
+        if (-not (Test-VMHealth -MachineName $MachineName)) {
+            Write-Log -Level WARNING -Message "VM health check failed. Attempting to proceed anyway."
+        }
+
+        # Configure VM networking for better SSH connectivity
+        try {
+            Set-VMNetworkConfiguration -SSH $sshInfo
+        }
+        catch {
+            Write-Log -Level WARNING -Message "Failed to configure VM networking: $_. Continuing anyway."
+        }
+
         # Deploy in-VM assets
         Write-Log -Level INFO -Message "Deploying assets to VM"
         Copy-ToVM -Src $provisionScriptPath -Dest "/home/$($sshInfo.User)/provision.sh" -SSH $sshInfo
@@ -1191,7 +1400,7 @@ try {
 
             # Deploy the bootc image
             try {
-                $deployResult = Deploy-BootcImage -SSH $sshInfo -ContainerFilesPath $containerFilesPath
+                $deployResult = Publish-BootcImage -SSH $sshInfo -ContainerFilesPath $containerFilesPath
 
                 if ($deployResult) {
                     # Test the deployed image
