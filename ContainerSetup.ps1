@@ -201,21 +201,36 @@ function Copy-ToVM {
         throw "Failed to copy file to VM: $_"
     }
 }
-
+powershell
 function Invoke-InVM {
-    [CmdletBinding()] Param(
+    <#
+    .SYNOPSIS
+        Executes a command inside a VM via SSH using Podman.
+    .PARAMETER Cmd
+        The shell command to execute inside the VM.
+    .PARAMETER SSH
+        Hashtable containing at least the 'MachineName' key for the target VM.
+    .OUTPUTS
+        String output from the executed command.
+    .NOTES
+        Throws if SSH is not ready or the command fails.
+    #>
+    [CmdletBinding()]
+    param (
         [Parameter(Mandatory)][string]$Cmd,
         [Parameter(Mandatory)][hashtable]$SSH
     )
-    # Wait for SSH to be ready
+
+    # Ensure SSH is ready before executing the command
     if (-not (Wait-ForSSHReady -MachineName $SSH.MachineName)) {
         throw "SSH connection not ready. Cannot execute commands in VM."
     }
+
     try {
         Write-Log -Level INFO -Message "Executing in VM: $Cmd"
         $result = & podman machine ssh $SSH.MachineName "$Cmd" 2>&1
         if ($LASTEXITCODE -ne 0) {
-            throw "Command failed with exit code ${LASTEXITCODE}: ${result}"
+            throw "Command failed with exit code $LASTEXITCODE $result"
         }
         return $result
     }
